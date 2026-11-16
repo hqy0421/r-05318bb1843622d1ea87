@@ -22,6 +22,11 @@
       <a class="nav-link{% block insert_tab_class %}{% endblock %}" href="{{ url_for('table_insert', table=table) }}">Insert</a>
     </li>
     {% endif %}
+    {% if not is_view %}
+    <li class="nav-item">
+      <a class="nav-link{% block clean_tab_class %}{% endblock %}" href="{{ url_for('table_clean', table=table) }}">Clean</a>
+    </li>
+    {% endif %}
     {% if not dataset.is_readonly and (not is_view or 'insert' in view_ops) %}
     <li class="nav-item ml-auto">
       <a class="nav-link{% block import_tab_class %}{% endblock %}" href="{{ url_for('table_import', table=table) }}">Import</a>

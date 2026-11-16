@@ -85,6 +85,11 @@ except ImportError:
         Result, is_read, key_decode, key_encode, run_one, run_script,
         split_statements, wrap)
 
+try:
+    from sqlite_web import backfill as clean
+except ImportError:
+    import backfill as clean
+
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
 DEBUG = False
@@ -1367,6 +1372,89 @@ def table_export(table):
         columns=columns,
         table=table)
 
+#
+# Recipe-driven code cleaning and dictionary backfill.
+#
+
+def _backfill_form(dataset, table):
+    """Values the backfill form was submitted with, with sane defaults."""
+    form = request.form
+    return {
+        'code_column': form.get('code_column') or '',
+        'dict_table': form.get('dict_table') or '',
+        'dict_code_column': form.get('dict_code_column') or '',
+        'mapping': form.get('mapping') or '',
+        'recipe': (form.get('recipe')
+                   if 'recipe' in form else clean.DEFAULT_RECIPE_TEXT),
+        'update_code': (form.get('update_code') == '1'
+                        if 'recipe' in form else True),
+    }
+
+def _backfill_config(table, values):
+    return clean.parse_config(
+        table,
+        values['code_column'],
+        values['dict_table'],
+        values['dict_code_column'],
+        values['mapping'],
+        values['recipe'],
+        values['update_code'])
+
+def _backfill_context(dataset, table, values, plan=None, error=None):
+    return {
+        'columns': [c.name for c in dataset.get_columns(table)],
+        'dataset': dataset,
+        'error': error,
+        'form': values,
+        'plan': plan,
+        'table': table,
+        'tables': sorted(dataset.cached_tables()),
+        'readonly': dataset.is_readonly,
+    }
+
+@app.route('/<table>/clean/', methods=['GET', 'POST'])
+@require_table
+def table_clean(table):
+    """Preview or apply a cleaning recipe + dictionary backfill.
+
+    GET renders the form.  POST with action=preview builds a plan and shows
+    it without writing anything.  POST with action=apply re-plans inside a
+    single transaction and updates only what was previewed; a stale preview
+    is refused rather than applied.
+    """
+    dataset = get_dataset()
+    dataset.ensure_cache()
+    values = _backfill_form(dataset, table)
+    plan = error = None
+    action = request.form.get('action')
+
+    if request.method == 'POST':
+        try:
+            if dataset.cached_is_view(table):
+                raise clean.CleanError(
+                    'Table "%s" is a view. Cleaning rewrites rows by primary '
+                    'key, so it works only on ordinary tables.' % table)
+            config = _backfill_config(table, values)
+            if action == 'apply':
+                fingerprint = request.form.get('fingerprint') or ''
+                plan = clean.apply_plan(dataset, config, fingerprint)
+                flash('Successfully updated %s row(s).' % plan.applied,
+                      'success')
+                return redirect(url_for('table_clean', table=table))
+            plan = clean.build_plan(dataset, config)
+        except (clean.StalePreview, clean.PlanRefused) as exc:
+            error = str(exc)
+            plan = exc.plan
+        except clean.CleanError as exc:
+            error = str(exc)
+        except Exception as exc:
+            app.logger.exception('Error while cleaning table %s.', table)
+            error = 'Unexpected error: %s' % exc
+
+    return render_template(
+        'table_clean.html',
+        **_backfill_context(dataset, table, values, plan, error))
+
 @app.route('/download/')
 def db_download():
     dataset = get_dataset()
@@ -1612,6 +1700,41 @@ def format_create_table(sql):
         return _format_create_table(sql)
     except Exception:
         return sql
+
+@app.template_filter('clean_cell')
+def clean_cell(cell, max_length=40):
+    """Render a backfill Cell so NULL, text 'NULL' and BLOBs stay distinct.
+
+    The kind comes from SQLite itself (typeof() on a probe row), never from
+    guessing at the display value.
+    """
+    if cell is None:
+        return Markup('<span class="text-muted">&mdash;</span>')
+    kind = cell.kind
+    if kind == 'null':
+        return Markup('<code class="cell-null">NULL</code>')
+    if kind == 'blob':
+        value = bytes(cell.value)
+        if app.config['BLOB_AS_BASE64']:
+            text = base64.b64encode(value).decode('ascii')
+        else:
+            text = value.hex()
+        shown = text[:max_length] + ('...' if len(text) > max_length else '')
+        if app.config['BLOB_AS_BASE64']:
+            shown = 'b64:%s' % shown
+        else:
+            shown = "X'%s'" % shown
+        return Markup('<code class="cell-blob">%s</code> '
+                      '<small class="text-muted">BLOB</small>' % escape(shown))
+    if kind == 'text':
+        text = cell.value
+        shown = value_filter(text)
+        if text == 'NULL':
+            shown = '%s <small class="text-muted">text</small>' % shown
+        elif text == '':
+            shown = '<small class="text-muted">empty text</small>'
+        return Markup(shown)
+    return cell.value
 
 @app.template_filter('highlight')
 def highlight_filter(data):

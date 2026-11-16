@@ -1,0 +1,186 @@
+{% extends "base_table.html" %}
+
+{% block clean_tab_class %} active{% endblock %}
+
+{% block inner_content %}
+<h3>Clean codes &amp; backfill from a dictionary</h3>
+<p class="small text-muted">
+  A recipe is an ordered list of steps &mdash; <code>trim</code>,
+  <code>case</code>, <code>replace</code> and <code>null</code> &mdash; applied
+  to the business code column and to the dictionary code column.  A row is only
+  updated when its cleaned code matches exactly one dictionary row; no match or
+  more than one match is an error.  Preview never changes the database.
+</p>
+
+{% if error %}
+  <div class="alert alert-danger"><code>{{ error }}</code></div>
+{% endif %}
+
+<form action="{{ url_for('table_clean', table=table) }}" autocomplete="off" method="post" role="form">
+  <div class="form-row">
+    <div class="form-group col-md-4">
+      <label for="id_code_column">Business code column</label>
+      <select class="form-control" id="id_code_column" name="code_column">
+        <option value="">-- select a column --</option>
+        {% for column in columns %}
+          <option value="{{ column }}"{% if form.code_column == column %} selected{% endif %}>{{ column }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group col-md-4">
+      <label for="id_dict_table">Dictionary table</label>
+      <select class="form-control" id="id_dict_table" name="dict_table">
+        <option value="">-- select a table --</option>
+        {% for name in tables %}
+          <option value="{{ name }}"{% if form.dict_table == name %} selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-group col-md-4">
+      <label for="id_dict_code_column">Dictionary code column</label>
+      <input class="form-control" id="id_dict_code_column" name="dict_code_column" type="text" value="{{ form.dict_code_column }}" placeholder="code" />
+      <small class="form-text text-muted">Checked against the dictionary table on preview.</small>
+    </div>
+  </div>
+
+  <div class="form-group">
+    <label for="id_recipe">Recipe (ordered JSON steps)</label>
+    <textarea class="form-control remember-size" id="id_recipe" name="recipe" spellcheck="false" style="height: 160px;">{{ form.recipe }}</textarea>
+    <small class="form-text text-muted">
+      Supported steps: <code>{"op": "trim"}</code>,
+      <code>{"op": "case", "mode": "upper"|"lower"}</code>,
+      <code>{"op": "replace", "pattern": "...", "replacement": "...",
+      "flags": "im"}</code> and
+      <code>{"op": "null", "fill": "...", "when": "blank"|"empty"|"null"}</code>.
+      A NULL code is only filled by a <code>null</code> step; the text
+      <code>NULL</code> is ordinary text and is never turned into SQL NULL.
+    </small>
+  </div>
+
+  <div class="form-group">
+    <label for="id_mapping">Dictionary columns to copy (one <code>source = target</code> per line)</label>
+    <textarea class="form-control remember-size" id="id_mapping" name="mapping" spellcheck="false" style="height: 80px;">{{ form.mapping }}</textarea>
+    <small class="form-text text-muted">
+      For example <code>category = grp</code>. Only the named target columns are
+      written; the primary key and every other column keep their value.
+    </small>
+  </div>
+
+  <div class="form-group form-check">
+    <input class="form-check-input" id="id_update_code" name="update_code" type="checkbox" value="1"{% if form.update_code %} checked{% endif %} />
+    <label class="form-check-label" for="id_update_code">Rewrite the business code column with the cleaned code</label>
+  </div>
+
+  <button class="btn btn-primary" name="action" type="submit" value="preview">Preview</button>
+  <a class="btn btn-secondary" href="{{ back_url(table) }}">Cancel</a>
+</form>
+
+{% if plan %}
+  <hr />
+  <h4>Preview</h4>
+  <div class="row">
+    <div class="col-md-4">
+      <table class="table table-sm table-bordered small">
+        <tbody>
+          <tr><th>Source rows</th><td>{{ plan.counts.source_rows }}</td></tr>
+          <tr><th>Matched</th><td class="text-success">{{ plan.counts.matched_rows }}</td></tr>
+          <tr><th>No match</th><td class="text-danger">{{ plan.counts.unmatched_rows }}</td></tr>
+          <tr><th>More than one match</th><td class="text-danger">{{ plan.counts.ambiguous_rows }}</td></tr>
+          <tr><th>Invalid code</th><td class="text-danger">{{ plan.counts.invalid_rows }}</td></tr>
+          <tr><th>Rows to update</th><td>{{ plan.counts.changed_rows }}</td></tr>
+          <tr><th>Rows unchanged</th><td>{{ plan.counts.unchanged_rows }}</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="col-md-8">
+      <table class="table table-sm table-bordered small">
+        <tbody>
+          <tr><th>Dictionary rows</th><td>{{ plan.counts.dictionary_rows }}</td></tr>
+          <tr><th>Usable dictionary codes</th><td>{{ plan.counts.dictionary_used }}</td></tr>
+          <tr><th>Skipped dictionary rows</th><td>{{ plan.counts.dictionary_skipped }}</td></tr>
+          <tr><th>Duplicate dictionary codes</th><td>{{ plan.counts.dictionary_duplicate_codes }}</td></tr>
+          <tr><th>Columns updated</th><td>{% for column in plan.updated_columns %}<code>{{ column }}</code>{% if not loop.last %}, {% endif %}{% endfor %}</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {% if plan.warnings %}
+    <div class="alert alert-warning">
+      <ul class="mb-0">
+        {% for warning in plan.warnings %}<li>{{ warning }}</li>{% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  {% if plan.error_rows %}
+    <div class="alert alert-danger">
+      <p class="mb-1"><strong>{{ plan.counts.error_rows }} row(s) cannot be updated.</strong> Fix the data or the recipe; applying is refused while any row has an error.</p>
+      <ul class="mb-0">
+        {% for row in plan.error_rows %}
+          <li>Row {{ row.pk_label }}: {{ row.error }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  <div class="table-wrapper">
+  <table class="table table-striped table-hover small cell-content">
+    <thead>
+      <tr>
+        <th scope="col">Row</th>
+        <th scope="col">Code before</th>
+        <th scope="col">Code after</th>
+        {% for source, target in plan.mapping %}
+          <th scope="col">{{ target }} before</th>
+          <th scope="col">{{ target }} after</th>
+        {% endfor %}
+        <th scope="col">Result</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in plan.display_rows %}
+        <tr{% if row.errors %} class="table-danger"{% endif %}>
+          <td><code>{{ row.pk_label }}</code></td>
+          <td>{{ row.code_before|clean_cell }}</td>
+          <td>{% if row.code_after %}{{ row.code_after|clean_cell }}{% elif row.norm_code is not none %}<code>{{ row.norm_code }}</code>{% else %}&mdash;{% endif %}</td>
+          {% for source, target in plan.mapping %}
+            <td>{{ row.before[target]|clean_cell }}</td>
+            <td>{% if target in row.after %}{{ row.after[target]|clean_cell }}{% else %}&mdash;{% endif %}</td>
+          {% endfor %}
+          <td>
+            {% if row.errors %}
+              <span class="text-danger">{{ row.error }}</span>
+            {% elif row.changed %}
+              <span class="text-success">update</span>
+            {% else %}
+              <span class="text-muted">unchanged</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% if plan.truncated %}
+    <p><small>Showing the first {{ plan.display_rows|length }} of {{ plan.counts.source_rows }} rows.</small></p>
+  {% endif %}
+
+  <form action="{{ url_for('table_clean', table=table) }}" autocomplete="off" method="post" role="form">
+    <input name="code_column" type="hidden" value="{{ form.code_column }}" />
+    <input name="dict_table" type="hidden" value="{{ form.dict_table }}" />
+    <input name="dict_code_column" type="hidden" value="{{ form.dict_code_column }}" />
+    <input name="mapping" type="hidden" value="{{ form.mapping }}" />
+    <textarea class="d-none" name="recipe">{{ form.recipe }}</textarea>
+    {% if form.update_code %}<input name="update_code" type="hidden" value="1" />{% endif %}
+    <input name="fingerprint" type="hidden" value="{{ plan.fingerprint }}" />
+    {% if readonly %}
+      <div class="alert alert-warning">The database is open read-only; preview is available but applying is disabled.</div>
+      <button class="btn btn-primary" type="button" disabled>Apply changes</button>
+    {% else %}
+      <button class="btn btn-danger" name="action" type="submit" value="apply"{% if plan.error_rows %} disabled{% endif %}>Apply changes</button>
+    {% endif %}
+    <a class="btn btn-secondary" href="{{ url_for('table_clean', table=table) }}">Start over</a>
+  </form>
+{% endif %}
+{% endblock %}

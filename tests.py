@@ -8,6 +8,7 @@ from peewee import SqliteDatabase
 from playhouse.dataset import DataSet
 
 from sqlite_web import sqlite_web as sw
+from sqlite_web import backfill as clean
 from sqlite_web.executor import Result
 from sqlite_web.executor import is_read
 from sqlite_web.executor import key_decode
@@ -988,6 +989,624 @@ class TestUrlPrefix(BaseAppTestCase):
     def test_session_cookie_scoped_to_prefix(self):
         r = self.client.get('/sqlite/users/content/')
         self.assertIn('Path=/sqlite', r.headers['Set-Cookie'])
+
+
+#
+# Backfill: recipe parsing and normalization.
+#
+
+class TestParseRecipe(unittest.TestCase):
+    def test_canonicalizes_steps(self):
+        recipe = clean.parse_recipe(
+            '[{"op": "case", "mode": "lower"}, '
+            ' {"op": "replace", "pattern": "a+", "replacement": "A", '
+            '  "flags": "IM"}, '
+            ' {"op": "trim", "chars": " "}, '
+            ' {"op": "null", "fill": "x"}]')
+        self.assertEqual([step['op'] for step in recipe.steps],
+                         ['case', 'replace', 'trim', 'null'])
+        # Flags are de-duplicated and sorted, so equivalent recipes hash the
+        # same and a preview cannot be invalidated by spelling.
+        self.assertEqual(recipe.steps[1]['flags'], 'im')
+        self.assertEqual(recipe.steps[3], {'op': 'null', 'fill': 'x'})
+        again = clean.parse_recipe(
+            '[{"op":"case","mode":"lower"},'
+            '{"op":"replace","pattern":"a+","replacement":"A",'
+            '"flags":"mi"},'
+            '{"op":"trim","chars":" "},{"op":"null","fill":"x"}]')
+        self.assertEqual(recipe.json, again.json)
+
+    def test_rejects_bad_input(self):
+        bad = [
+            '',
+            'not json',
+            '{}',
+            '["trim"]',
+            '[1]',
+            '[{"op": "wat"}]',
+            '[{"op": "case"}]',
+            '[{"op": "case", "mode": "sideways"}]',
+            '[{"op": "replace", "pattern": "(", "replacement": ""}]',
+            '[{"op": "replace", "pattern": "", "replacement": ""}]',
+            '[{"op": "replace", "pattern": "a", "replacement": "", '
+            '"flags": "q"}]',
+            '[{"op": "trim", "extra": 1}]',
+            '[{"op": "null", "fill": 2}]',
+            '[{"op": "null", "fill": "x", "when": "always"}]',
+            '[' + ','.join(['{"op": "trim"}'] * (clean.MAX_STEPS + 1)) + ']',
+        ]
+        for text in bad:
+            with self.assertRaises(clean.CleanError, msg=text):
+                clean.parse_recipe(text)
+
+
+class TestApplyRecipe(unittest.TestCase):
+    def recipe(self, *steps):
+        import json
+        return clean.parse_recipe(json.dumps(list(steps)))
+
+    def test_ordered_pipeline(self):
+        recipe = self.recipe(
+            {'op': 'trim'},
+            {'op': 'replace', 'pattern': r'(\d)\s+', 'replacement': r'\1-'},
+            {'op': 'case', 'mode': 'upper'})
+        self.assertEqual(clean.apply_recipe(recipe, '  a 1 b2 ')[0],
+                         'A 1-B2')
+
+    def test_null_is_not_the_text_null(self):
+        recipe = self.recipe({'op': 'case', 'mode': 'upper'},
+                             {'op': 'null', 'fill': 'X'})
+        # NULL stays NULL through text steps, then the null step fills it.
+        self.assertEqual(clean.apply_recipe(recipe, None), ('X', None))
+        # The four characters N-U-L-L are just text.
+        self.assertEqual(clean.apply_recipe(recipe, 'null'), ('NULL', None))
+        no_fill = self.recipe({'op': 'case', 'mode': 'upper'})
+        self.assertEqual(clean.apply_recipe(no_fill, None), (None, None))
+        self.assertEqual(clean.apply_recipe(no_fill, 'null'), ('NULL', None))
+
+    def test_null_when_modes(self):
+        blank = self.recipe({'op': 'null', 'fill': 'B'})
+        self.assertEqual(clean.apply_recipe(blank, '  ')[0], 'B')
+        empty = self.recipe({'op': 'null', 'fill': 'E', 'when': 'empty'})
+        self.assertEqual(clean.apply_recipe(empty, '  ')[0], '  ')
+        self.assertEqual(clean.apply_recipe(empty, '')[0], 'E')
+        null = self.recipe({'op': 'null', 'fill': 'N', 'when': 'null'})
+        self.assertEqual(clean.apply_recipe(null, '')[0], '')
+        self.assertEqual(clean.apply_recipe(null, None)[0], 'N')
+
+    def test_blob_code_is_an_error(self):
+        recipe = self.recipe({'op': 'trim'})
+        value, error = clean.apply_recipe(recipe, b'\x00\xff')
+        self.assertIsNone(value)
+        self.assertIn('BLOB', error)
+
+    def test_parse_mapping(self):
+        self.assertEqual(
+            clean.parse_mapping('category = grp\n# comment\n'
+                                'weight -> qty'),
+            [('category', 'grp'), ('weight', 'qty')])
+        self.assertEqual(clean.parse_mapping('{"a": "b"}'), [('a', 'b')])
+        self.assertEqual(clean.parse_mapping(''), [])
+        for text in ('nonsense', 'x = a\ny = a', '= x', 'x ='):
+            with self.assertRaises(clean.CleanError, msg=text):
+                clean.parse_mapping(text)
+
+
+#
+# Backfill: planning and applying against a real database.
+#
+
+class BaseBackfillTestCase(BaseAppTestCase):
+    SCHEMA = BaseAppTestCase.SCHEMA + """
+        CREATE TABLE biz (id INTEGER PRIMARY KEY, code TEXT, grp TEXT,
+            qty INTEGER, note TEXT);
+        INSERT INTO biz (code, grp, qty, note) VALUES
+            (' a1 ', NULL, NULL, 'one'),
+            ('b2', 'old', 7, 'two'),
+            ('zzz', NULL, NULL, 'three');
+        CREATE TABLE dict (id INTEGER PRIMARY KEY, code TEXT, category TEXT,
+            weight INTEGER);
+        INSERT INTO dict (code, category, weight) VALUES
+            ('A1', 'cat-a', 10), ('B2', 'cat-b', 20);
+    """
+
+    RECIPE = '[{"op": "trim"}, {"op": "case", "mode": "upper"}]'
+
+    def config(self, **kwargs):
+        values = {
+            'table': 'biz',
+            'code_column': 'code',
+            'dict_table': 'dict',
+            'dict_code_column': 'code',
+            'mapping_text': 'category = grp\nweight = qty',
+            'recipe_text': self.RECIPE,
+            'update_code': True,
+        }
+        values.update(kwargs)
+        return clean.parse_config(**values)
+
+    def dataset(self):
+        return sw.datasets[sw.datasets and list(sw.datasets)[0]]
+
+    def biz_rows(self):
+        return self.dbrows('SELECT * FROM biz ORDER BY id')
+
+
+class TestBuildPlan(BaseBackfillTestCase):
+    def test_preview_does_not_modify_business_rows(self):
+        before = self.biz_rows()
+        dataset = self.dataset()
+        plan = clean.build_plan(dataset, self.config())
+        self.assertEqual(self.biz_rows(), before)
+        self.assertEqual(plan.counts['source_rows'], 3)
+        self.assertEqual(plan.counts['matched_rows'], 2)
+        self.assertEqual(plan.counts['unmatched_rows'], 1)
+        self.assertEqual(plan.counts['error_rows'], 1)
+        # The plan's rows inspect what SQLite would store, not the raw text.
+        first = plan.rows[0]
+        self.assertEqual(first.code_before, clean.Cell('text', ' a1 '))
+        self.assertEqual(first.code_after, clean.Cell('text', 'A1'))
+
+    def test_shows_values_sqlite_would_store(self):
+        # "10" as text is stored as an integer in an INTEGER column, and the
+        # preview must say so: applying it must not surprise anyone.
+        plan = clean.build_plan(self.dataset(), self.config())
+        row = [row for row in plan.rows if row.pk_label == '1'][0]
+        self.assertEqual(row.after['qty'], clean.Cell('integer', 10))
+
+    def test_no_match_and_ambiguous_match_are_errors(self):
+        dataset = self.dataset()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO dict (code, category, weight) "
+                     "VALUES ('ZZZ', 'cat-z', 1)")
+        conn.commit()
+        conn.close()
+        plan = clean.build_plan(dataset, self.config())
+        # 'zzz' now matches exactly one row.
+        self.assertEqual(plan.counts['unmatched_rows'], 0)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO dict (code, category, weight) "
+                     "VALUES ('zzz', 'cat-z2', 2)")
+        conn.commit()
+        conn.close()
+        plan = clean.build_plan(dataset, self.config())
+        self.assertEqual(plan.counts['ambiguous_rows'], 1)
+        row = [row for row in plan.error_rows
+               if row.pk_label == '3'][0]
+        self.assertIn('exactly one match is required', row.error)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('DELETE FROM dict')
+        conn.commit()
+        conn.close()
+        plan = clean.build_plan(dataset, self.config())
+        self.assertEqual(plan.counts['unmatched_rows'], 3)
+
+    def test_code_only_recipe(self):
+        plan = clean.build_plan(
+            self.dataset(), self.config(mapping_text=''))
+        self.assertEqual(plan.updated_columns, ['code'])
+        self.assertEqual(plan.counts['unmatched_rows'], 1)
+
+    def test_requires_writable_target_and_pk(self):
+        dataset = self.dataset()
+        with self.assertRaises(clean.CleanError):
+            clean.build_plan(dataset, self.config(code_column='missing'))
+        with self.assertRaises(clean.CleanError):
+            clean.build_plan(dataset, self.config(mapping_text='id = id'))
+        with self.assertRaises(clean.CleanError):
+            clean.build_plan(dataset, self.config(table='nopk'))
+        with self.assertRaises(clean.CleanError):
+            clean.build_plan(dataset, self.config(table='v_users'))
+        with self.assertRaises(clean.CleanError):
+            clean.build_plan(dataset, self.config(update_code=False,
+                                                  mapping_text=''))
+
+    def test_duplicate_dictionary_codes_are_counted(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO dict (code, category, weight) "
+                     "VALUES (' a1 ', 'cat-a2', 11)")
+        conn.commit()
+        conn.close()
+        plan = clean.build_plan(self.dataset(), self.config())
+        self.assertEqual(plan.counts['dictionary_duplicate_codes'], 1)
+        self.assertEqual(plan.counts['ambiguous_rows'], 1)
+
+
+class TestApplyPlan(BaseBackfillTestCase):
+    def test_apply_updates_only_selected_columns_by_pk(self):
+        dataset = self.dataset()
+        before = self.biz_rows()
+        config = self.config()
+        # Drop the row that cannot match so the batch is clean.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM biz WHERE code = 'zzz'")
+        conn.commit()
+        conn.close()
+        before = self.biz_rows()
+
+        plan = clean.build_plan(dataset, config)
+        result = clean.apply_plan(dataset, config, plan.fingerprint)
+        self.assertEqual(result.applied, 2)
+        after = self.biz_rows()
+        self.assertEqual([(r[0], r[1], r[2], r[3], r[4]) for r in after],
+                         [(1, 'A1', 'cat-a', 10, 'one'),
+                          (2, 'B2', 'cat-b', 20, 'two')])
+        # Primary keys and unselected columns are untouched; only the
+        # mapped columns and the code differ from before.
+        for old, new in zip(before, after):
+            self.assertEqual(old[0], new[0])
+            self.assertEqual(old[4], new[4])
+
+    def test_stale_preview_is_refused(self):
+        dataset = self.dataset()
+        config = self.config()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM biz WHERE code = 'zzz'")
+        conn.commit()
+        conn.close()
+        plan = clean.build_plan(dataset, config)
+
+        # A dictionary edit invalidates the preview.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE dict SET category = 'changed' "
+                     "WHERE code = 'A1'")
+        conn.commit()
+        conn.close()
+        before = self.biz_rows()
+        with self.assertRaises(clean.StalePreview):
+            clean.apply_plan(dataset, config, plan.fingerprint)
+        self.assertEqual(self.biz_rows(), before)
+
+        # A recipe edit invalidates it as well.
+        fresh = clean.build_plan(dataset, config)
+        edited = self.config(recipe_text='[{"op": "trim"}]')
+        with self.assertRaises(clean.StalePreview):
+            clean.apply_plan(dataset, edited, fresh.fingerprint)
+        self.assertEqual(self.biz_rows(), before)
+
+        # A missing fingerprint means "not previewed".
+        with self.assertRaises(clean.StalePreview):
+            clean.apply_plan(dataset, config, '')
+        self.assertEqual(self.biz_rows(), before)
+
+    def test_source_and_schema_changes_invalidate_the_preview(self):
+        dataset = self.dataset()
+        config = self.config()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM biz WHERE code = 'zzz'")
+        conn.commit()
+        conn.close()
+        plan = clean.build_plan(dataset, config)
+
+        # A business-row edit (here: a changed unselected column) is enough.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE biz SET note = 'edited' WHERE id = 1")
+        conn.commit()
+        conn.close()
+        before = self.biz_rows()
+        with self.assertRaises(clean.StalePreview):
+            clean.apply_plan(dataset, config, plan.fingerprint)
+        self.assertEqual(self.biz_rows(), before)
+
+        # A new row is a source change too.
+        fresh = clean.build_plan(dataset, config)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO biz (code, note) VALUES ('a1', 'new')")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(clean.StalePreview):
+            clean.apply_plan(dataset, config, fresh.fingerprint)
+
+        # A table-structure change invalidates it; the re-plan then fails
+        # loudly because the column is gone.
+        fresh = clean.build_plan(dataset, config)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('ALTER TABLE biz ADD COLUMN extra TEXT')
+        conn.commit()
+        conn.close()
+        with self.assertRaises(clean.StalePreview):
+            clean.apply_plan(dataset, config, fresh.fingerprint)
+        self.assertEqual(
+            self.dbrows('SELECT note FROM biz ORDER BY id')[0], ('edited',))
+
+    def test_errors_refuse_the_whole_batch(self):
+        dataset = self.dataset()
+        before = self.biz_rows()
+        plan = clean.build_plan(dataset, self.config())
+        self.assertTrue(plan.error_count)
+        with self.assertRaises(clean.PlanRefused):
+            clean.apply_plan(dataset, self.config(), plan.fingerprint)
+        self.assertEqual(self.biz_rows(), before)
+
+    def test_constraint_error_rolls_back_everything(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript("""
+            DROP TABLE biz;
+            CREATE TABLE biz (id INTEGER PRIMARY KEY, code TEXT, grp TEXT,
+                qty INTEGER CHECK (qty < 15), note TEXT);
+            INSERT INTO biz (code, grp, qty, note) VALUES
+                (' a1 ', NULL, NULL, 'one'),
+                ('b2', NULL, NULL, 'two');
+        """)
+        conn.commit()
+        conn.close()
+        dataset = self.dataset()
+        config = self.config()
+        plan = clean.build_plan(dataset, config)
+        # The CHECK constraint is not modeled by the probe, so planning
+        # succeeds and the failure surfaces while applying.  The first row
+        # (qty 10) would pass; the second (qty 20) fails, proving the whole
+        # batch rolls back including the already-applied first update.
+        self.assertEqual(plan.counts['error_rows'], 0)
+        before = self.biz_rows()
+        with self.assertRaises(clean.CleanError) as ctx:
+            clean.apply_plan(dataset, config, plan.fingerprint)
+        self.assertIn('rolled back', str(ctx.exception))
+        self.assertEqual(self.biz_rows(), before)
+
+    def test_strict_table_conversion_error_is_previewed(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript("""
+            DROP TABLE biz;
+            CREATE TABLE biz (id INTEGER PRIMARY KEY, code TEXT, grp TEXT,
+                qty INTEGER, note TEXT) STRICT;
+            INSERT INTO biz (code, grp, qty, note) VALUES
+                (' a1 ', NULL, NULL, 'one'),
+                ('b2', NULL, NULL, 'two');
+            UPDATE dict SET weight = 'not-a-number' WHERE code = 'B2';
+        """)
+        conn.commit()
+        conn.close()
+        dataset = self.dataset()
+        config = self.config()
+        plan = clean.build_plan(dataset, config)
+        self.assertEqual(plan.counts['error_rows'], 1)
+        row = plan.error_rows[0]
+        self.assertEqual(row.pk_label, '2')
+        self.assertIn('qty', row.error)
+        before = self.biz_rows()
+        with self.assertRaises(clean.PlanRefused):
+            clean.apply_plan(dataset, config, plan.fingerprint)
+        self.assertEqual(self.biz_rows(), before)
+
+    def test_without_rowid_table(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript("""
+            DROP TABLE biz;
+            CREATE TABLE biz (code TEXT, id TEXT, grp TEXT, qty INTEGER,
+                note TEXT, PRIMARY KEY (id)) WITHOUT ROWID;
+            INSERT INTO biz VALUES (' a1 ', 'x', NULL, NULL, 'one'),
+                                   ('b2', 'y', NULL, NULL, 'two');
+        """)
+        conn.commit()
+        conn.close()
+        dataset = self.dataset()
+        config = self.config()
+        plan = clean.build_plan(dataset, config)
+        self.assertEqual(plan.error_count, 0)
+        self.assertEqual(clean.apply_plan(dataset, config,
+                                          plan.fingerprint).applied, 2)
+        self.assertEqual(
+            self.dbrows('SELECT code, id, grp, qty, note FROM biz '
+                        'ORDER BY id'),
+            [('A1', 'x', 'cat-a', 10, 'one'),
+             ('B2', 'y', 'cat-b', 20, 'two')])
+
+    def test_primary_key_columns_are_immutable(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript("""
+            DROP TABLE biz;
+            CREATE TABLE biz (code TEXT PRIMARY KEY, grp TEXT,
+                qty INTEGER, note TEXT) WITHOUT ROWID;
+            INSERT INTO biz VALUES (' a1 ', NULL, NULL, 'one');
+        """)
+        conn.commit()
+        conn.close()
+        dataset = self.dataset()
+        # Rewriting a code that is part of the primary key would change the
+        # key, which the feature promises never to do.
+        with self.assertRaises(clean.CleanError) as ctx:
+            clean.build_plan(dataset, self.config())
+        self.assertIn('primary key', str(ctx.exception))
+        # Mapping a different column still works with the code untouched.
+        plan = clean.build_plan(
+            dataset, self.config(update_code=False))
+        self.assertEqual(plan.counts['error_rows'], 0)
+
+    def test_null_text_and_blob_stay_distinct(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript("""
+            DROP TABLE biz;
+            CREATE TABLE biz (id INTEGER PRIMARY KEY, code, grp TEXT,
+                note TEXT);
+            INSERT INTO biz (code, note) VALUES
+                (x'4142', 'blob'), ('NULL', 'text-null'), (NULL, 'sqlnull'),
+                (' a1 ', 'match');
+            INSERT INTO dict (code, category, weight) VALUES
+                ('NULL', 'cat-textnull', 1);
+        """)
+        conn.commit()
+        conn.close()
+        dataset = self.dataset()
+        config = self.config(mapping_text='category = grp')
+        plan = clean.build_plan(dataset, config)
+        by_pk = {row.pk_label: row for row in plan.rows}
+        self.assertEqual(by_pk['1'].code_before, clean.Cell('blob', b'AB'))
+        self.assertEqual(by_pk['2'].code_before, clean.Cell('text', 'NULL'))
+        self.assertEqual(by_pk['3'].code_before, clean.Cell('null'))
+        # The BLOB and the NULL had no dictionary match/recipe.
+        self.assertIn('BLOB', by_pk['1'].error)
+        self.assertIn('NULL', by_pk['3'].error)
+        # The text "NULL" matched a dictionary row with code 'NULL'.
+        self.assertEqual(by_pk['2'].match_state, 'ok')
+        self.assertEqual(by_pk['4'].code_after, clean.Cell('text', 'A1'))
+
+        # Applying keeps the BLOB as a BLOB and the text NULL as text.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('DELETE FROM biz WHERE id IN (1, 3)')
+        conn.commit()
+        conn.close()
+        plan = clean.build_plan(dataset, config)
+        self.assertEqual(plan.error_count, 0)
+        clean.apply_plan(dataset, config, plan.fingerprint)
+        rows = self.dbrows('SELECT id, typeof(code), code FROM biz '
+                           'ORDER BY id')
+        self.assertEqual(rows[0][1:], ('text', 'NULL'))
+        self.assertEqual(rows[1][1:], ('text', 'A1'))
+
+
+class TestCleanRoute(BaseBackfillTestCase):
+    def preview(self, **overrides):
+        data = {
+            'code_column': 'code',
+            'dict_table': 'dict',
+            'dict_code_column': 'code',
+            'mapping': 'category = grp\nweight = qty',
+            'recipe': self.RECIPE,
+            'update_code': '1',
+            'action': 'preview',
+        }
+        data.update(overrides)
+        return self.client.post('/biz/clean/', data=data)
+
+    def fingerprint(self, html):
+        import re as _re
+        match = _re.search(rb'name="fingerprint" type="hidden" '
+                           rb'value="([0-9a-f]+)"', html)
+        self.assertIsNotNone(match)
+        return match.group(1).decode('ascii')
+
+    def test_clean_tab_and_form(self):
+        r = self.client.get('/biz/clean/')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'Business code column', r.data)
+        self.assertIn(b'Clean', self.client.get('/biz/').data)
+
+    def test_preview_leaves_the_database_alone(self):
+        before = self.biz_rows()
+        r = self.preview()
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.biz_rows(), before)
+        self.assertIn(b'No dictionary row matches', r.data)
+        # The preview distinguishes SQL NULL from the text NULL and BLOB.
+        self.assertIn(b'cell-null', r.data)
+
+    def test_apply_roundtrip_and_stale_refusal(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM biz WHERE code = 'zzz'")
+        conn.commit()
+        conn.close()
+        before = self.biz_rows()
+        r = self.preview()
+        fingerprint = self.fingerprint(r.data)
+        data = {
+            'code_column': 'code',
+            'dict_table': 'dict',
+            'dict_code_column': 'code',
+            'mapping': 'category = grp\nweight = qty',
+            'recipe': self.RECIPE,
+            'update_code': '1',
+            'action': 'apply',
+            'fingerprint': fingerprint,
+        }
+        # Applying with a bogus fingerprint refuses and leaves rows intact.
+        stale = dict(data, fingerprint='nope')
+        r = self.client.post('/biz/clean/', data=stale)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'changed since the preview', r.data)
+        self.assertEqual(self.biz_rows(), before)
+
+        r = self.client.post('/biz/clean/', data=data, follow_redirects=True)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'Successfully updated 2 row(s)', r.data)
+        self.assertEqual(
+            self.dbrows('SELECT id, code, grp, qty, note FROM biz '
+                        'ORDER BY id'),
+            [(1, 'A1', 'cat-a', 10, 'one'),
+             (2, 'B2', 'cat-b', 20, 'two')])
+
+    def test_apply_refused_when_rows_have_errors(self):
+        before = self.biz_rows()
+        r = self.preview()
+        self.assertIn(b'Apply changes', r.data)
+        # The button is disabled client-side, but a crafted POST must still
+        # be refused server-side.
+        data = {
+            'code_column': 'code',
+            'dict_table': 'dict',
+            'dict_code_column': 'code',
+            'mapping': 'category = grp\nweight = qty',
+            'recipe': self.RECIPE,
+            'update_code': '1',
+            'action': 'apply',
+            'fingerprint': self.fingerprint(r.data),
+        }
+        r = self.client.post('/biz/clean/', data=data)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'nothing was updated', r.data)
+        self.assertEqual(self.biz_rows(), before)
+
+    def test_view_is_rejected(self):
+        data = {
+            'code_column': 'id',
+            'dict_table': 'dict',
+            'dict_code_column': 'code',
+            'mapping': '',
+            'recipe': self.RECIPE,
+            'action': 'preview',
+        }
+        r = self.client.post('/v_users/clean/', data=data)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'is a view', r.data)
+        self.assertNotIn(b'/v_users/clean/', self.client.get(
+            '/v_users/structure/').data)
+
+    def test_unknown_table_404s(self):
+        self.assertEqual(self.client.get('/nope/clean/').status_code, 404)
+
+    def test_bad_recipe_shows_error(self):
+        r = self.preview(recipe='[{"op": "nope"}]')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'unknown op', r.data)
+
+
+class TestCleanReadOnly(BaseBackfillTestCase):
+    def setUp(self):
+        super(TestCleanReadOnly, self).setUp()
+        sw.datasets.clear()
+        sw.initialize_app([self.db_path], read_only=True)
+        self.client = sw.app.test_client()
+
+    def tearDown(self):
+        super(TestCleanReadOnly, self).tearDown()
+        sw.dataset_config['read_only'] = False
+
+    def test_preview_works_apply_is_disabled(self):
+        data = {
+            'code_column': 'code',
+            'dict_table': 'dict',
+            'dict_code_column': 'code',
+            'mapping': 'category = grp',
+            'recipe': self.RECIPE,
+            'update_code': '1',
+            'action': 'preview',
+        }
+        before = self.biz_rows()
+        r = self.client.post('/biz/clean/', data=data)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'read-only', r.data)
+        self.assertNotIn(b'name="action" type="submit" value="apply"',
+                         r.data)
+        self.assertEqual(self.biz_rows(), before)
+
+        # A crafted apply is refused at the application layer.
+        data.update(action='apply', fingerprint='x')
+        r = self.client.post('/biz/clean/', data=data)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'read-only', r.data)
+        self.assertEqual(self.biz_rows(), before)
 
 
 if __name__ == '__main__':
